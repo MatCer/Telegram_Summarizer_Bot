@@ -2,6 +2,7 @@ import telebot
 import pandas as pd
 import datetime
 import os
+import time
 
 import sys
 from dotenv import load_dotenv
@@ -117,6 +118,20 @@ def summarize_text(text):
         raise
 
 
+def safe_reply_to(message, text, **kwargs):
+    """Safely reply to a message with error handling."""
+    try:
+        return bot.reply_to(message, text, **kwargs)
+    except Exception as e:
+        print(f"Error sending reply: {e}")
+        # Try to send a simple message instead if reply fails
+        try:
+            bot.send_message(message.chat.id, text, **kwargs)
+        except Exception as e2:
+            print(f"Error sending message: {e2}")
+        return None
+
+
 def save_message_to_csv(user_id, username, chat_id, text, date_str):
     """Helper function to save a message to CSV"""
     df = pd.DataFrame([[user_id, username, chat_id, text, date_str]], 
@@ -148,12 +163,12 @@ def save_message_to_csv(user_id, username, chat_id, text, date_str):
 # Command to start the bot
 @bot.message_handler(commands=["start"])
 def send_welcome(message):
-    bot.reply_to(
+    safe_reply_to(
         message,
         f"Hello! You can summarize your messages in the group using Google Gemini AI.\n\n"
         "*Commands:*\n"
         "- `/summarize <option>` - Summarize messages\n"
-        "- `/sync` - Fetch recent messages (messages sent after bot was added)\n\n"
+        "- `/sync` - Check message logging status\n\n"
         "*Time-based options:* \n"
         "- `12hr` (Last 12 hours)\n"
         "- `18hr` (Last 18 hours)\n"
@@ -186,13 +201,13 @@ def summarize_messages(message):
             if count <= 0:
                 raise ValueError("Count must be positive")
             if count > 10000:
-                bot.reply_to(message, "❌ Maximum count is 10000 messages. Please use a smaller number.")
+                safe_reply_to(message, "❌ Maximum count is 10000 messages. Please use a smaller number.")
                 return
             
             option_display = f"last {count} messages"
             
         except (ValueError, IndexError):
-            bot.reply_to(
+            safe_reply_to(
                 message,
                 "Invalid format for count-based option.\n\n"
                 "Use: `/summarize last <number>`\n"
@@ -204,7 +219,7 @@ def summarize_messages(message):
         hours = TIME_INTERVALS[text_parts[1]]
         option_display = text_parts[1]
     else:
-        bot.reply_to(
+        safe_reply_to(
             message,
             "Invalid format. Use:\n"
             "- `/summarize <time_option>` (e.g., `/summarize 1day`)\n"
@@ -215,18 +230,18 @@ def summarize_messages(message):
     try:
         # Check if file exists and has content
         if not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0:
-            bot.reply_to(message, "No messages found. The message log is empty. Start chatting in the group to log messages.")
+            safe_reply_to(message, "No messages found. The message log is empty. Start chatting in the group to log messages.")
             return
         
         try:
             df = pd.read_csv(LOG_FILE)
         except pd.errors.EmptyDataError:
-            bot.reply_to(message, "No messages found. The message log is empty. Start chatting in the group to log messages.")
+            safe_reply_to(message, "No messages found. The message log is empty. Start chatting in the group to log messages.")
             return
         
         # Check if DataFrame is empty
         if df.empty:
-            bot.reply_to(message, "No messages found. The message log is empty. Start chatting in the group to log messages.")
+            safe_reply_to(message, "No messages found. The message log is empty. Start chatting in the group to log messages.")
             return
         
         df["date"] = pd.to_datetime(df["date"])
@@ -257,9 +272,9 @@ def summarize_messages(message):
 
         if group_messages.empty:
             if is_count_based:
-                bot.reply_to(message, f"No messages found in this group.")
+                safe_reply_to(message, f"No messages found in this group.")
             else:
-                bot.reply_to(message, "No messages found in the selected time range.")
+                safe_reply_to(message, "No messages found in the selected time range.")
             return
 
         # Sort by date ascending for proper message order
@@ -270,76 +285,66 @@ def summarize_messages(message):
 
         # Check if messages_text is empty
         if not messages_text or not messages_text.strip():
-            bot.reply_to(message, "No valid messages found.")
+            safe_reply_to(message, "No valid messages found.")
             return
 
         # Summarize messages
         try:
             summary = summarize_text(messages_text)
-            bot.reply_to(message, f"📊 *Summary for {option_display}:*\n\n_{summary}_")
+            safe_reply_to(message, f"📊 *Summary for {option_display}:*\n\n_{summary}_")
         except Exception as e:
             print(f"Summarization error: {e}")
-            bot.reply_to(message, f"❌ Error generating summary: {str(e)}")
+            safe_reply_to(message, f"❌ Error generating summary: {str(e)}")
 
     except FileNotFoundError:
-        bot.reply_to(message, "No messages found. Ensure message logging is enabled.")
+        safe_reply_to(message, "No messages found. Ensure message logging is enabled.")
     except Exception as e:
         print(f"Error: {e}")
-        bot.reply_to(message, f"❌ An error occurred: {str(e)}")
+        safe_reply_to(message, f"❌ An error occurred: {str(e)}")
 
 
 # Command to sync/fetch recent messages
 @bot.message_handler(commands=["sync"])
 def sync_messages(message):
-    """Attempts to fetch and log recent messages from the group."""
+    """Provides information about message syncing."""
     if message.chat.type not in ["group", "supergroup"]:
-        bot.reply_to(message, "This command can only be used in groups.")
+        safe_reply_to(message, "This command can only be used in groups.")
         return
     
     chat_id = message.chat.id
-    bot.reply_to(message, "⏳ Syncing messages... This may take a moment.")
     
     try:
-        # Get recent updates from Telegram
-        # Note: Bots can only access messages sent after they were added to the group
-        updates = bot.get_updates(limit=100, timeout=1)
-        
-        synced_count = 0
-        for update in updates:
-            if hasattr(update, 'message') and update.message:
-                msg = update.message
-                if (msg.chat.id == chat_id and 
-                    msg.chat.type in ["group", "supergroup"] and
-                    msg.text and 
-                    not msg.text.startswith('/')):
-                    # Extract message data
-                    user_id = msg.from_user.id if msg.from_user else 0
-                    username = msg.from_user.username if msg.from_user and msg.from_user.username else "Unknown"
-                    text = msg.text
-                    # Convert message date to our format
-                    msg_date = datetime.datetime.fromtimestamp(msg.date)
-                    date_str = msg_date.strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    # Save message
-                    if save_message_to_csv(user_id, username, chat_id, text, date_str):
-                        synced_count += 1
-        
-        if synced_count > 0:
-            bot.reply_to(message, f"✅ Synced {synced_count} messages to the log.")
+        # Count messages in the log for this chat
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 0:
+            df = pd.read_csv(LOG_FILE)
+            if "chat_id" in df.columns:
+                chat_messages = df[df["chat_id"] == chat_id]
+                message_count = len(chat_messages)
+            else:
+                message_count = len(df)
+            
+            safe_reply_to(
+                message,
+                f"✅ Message logging is active!\n\n"
+                f"📊 *Current stats:*\n"
+                f"- Messages logged in this group: {message_count}\n\n"
+                f"*Note:* The bot automatically logs all new messages sent after it was added to the group. "
+                f"Messages sent before the bot was added cannot be retrieved due to Telegram API restrictions."
+            )
         else:
-            bot.reply_to(
-                message, 
-                "No new messages found to sync.\n\n"
-                "Note: Bots can only access messages sent after they were added to the group. "
-                "Messages sent before the bot was added cannot be retrieved."
+            safe_reply_to(
+                message,
+                "📝 Message logging is ready!\n\n"
+                "The bot will automatically log all new messages sent in this group. "
+                "Messages sent before the bot was added cannot be retrieved due to Telegram API restrictions."
             )
     except Exception as e:
-        print(f"Sync error: {e}")
-        bot.reply_to(
+        print(f"Sync command error: {e}")
+        safe_reply_to(
             message, 
-            f"⚠️ Sync completed with limitations.\n\n"
-            "Note: Due to Telegram API restrictions, bots can only access messages sent after they were added to the group. "
-            "The bot will automatically log all new messages going forward."
+            "⚠️ Error checking message log.\n\n"
+            "The bot automatically logs all new messages sent after it was added to the group. "
+            "Messages sent before the bot was added cannot be retrieved due to Telegram API restrictions."
         )
 
 
@@ -374,6 +379,36 @@ def log_messages(message):
         save_message_to_csv(user_id, username, chat_id, text, date)
 
 
-# Start the bot
-print("Bot is running...")
-bot.polling(none_stop=True)
+# Start the bot with error handling
+def start_bot():
+    """Start the bot with error handling and retry logic."""
+    retry_delay = 5  # seconds
+    
+    while True:
+        try:
+            print("Bot is starting...")
+            bot.polling(none_stop=True, interval=1, timeout=20)
+        except KeyboardInterrupt:
+            print("\n⏹️  Bot stopped by user.")
+            break
+        except Exception as e:
+            error_str = str(e)
+            # Check for 409 Conflict error (multiple bot instances)
+            if "409" in error_str or "Conflict" in error_str or "terminated by other getUpdates" in error_str:
+                print(f"❌ Error 409: Another bot instance may be running!")
+                print("   Make sure only one instance of the bot is running.")
+                print("   If you're sure only one instance is running, wait a few seconds and the bot will retry.")
+            # Check for connection errors
+            elif "Connection" in error_str or "RemoteDisconnected" in error_str or "Connection aborted" in error_str:
+                print(f"❌ Connection error: {e}")
+                print("   This may be due to network issues or Telegram API being temporarily unavailable.")
+            else:
+                print(f"❌ Unexpected error: {e}")
+            
+            print(f"   Retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+
+
+if __name__ == "__main__":
+    print("Bot is running...")
+    start_bot()
