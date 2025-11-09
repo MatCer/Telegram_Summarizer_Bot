@@ -47,49 +47,14 @@ try:
             pass
     genai.configure(api_key=GOOGLE_API_KEY)
     
-    # Try to find an available model - list of models to try (free tier compatible)
-    model_names_to_try = [
-        'gemini-2.0-flash-exp',
-        'gemini-1.5-flash',
-        'gemini-1.5-pro',
-        'gemini-pro',
-        'gemini-2.5-flash-lite'
-    ]
-    
-    model = None
-    model_name = None
-    
-    # First, try to list available models
-    try:
-        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        print(f"Available models: {available_models}")
-        
-        # Try to find a matching model from our list
-        for name in model_names_to_try:
-            # Check if model name matches (could be full path like 'models/gemini-1.5-flash')
-            matching = [m for m in available_models if name in m]
-            if matching:
-                model_name = matching[0].split('/')[-1] if '/' in matching[0] else matching[0]
-                model = genai.GenerativeModel(model_name)
-                print(f"[OK] Using Google Gemini API model: {model_name}")
-                break
-    except Exception as e:
-        print(f"Could not list models: {e}")
-        # Fallback: try models directly
-        for name in model_names_to_try:
-            try:
-                model = genai.GenerativeModel(name)
-                model_name = name
-                print(f"[OK] Using Google Gemini API model: {name}")
-                break
-            except Exception:
-                continue
-    
-    if model is None:
-        raise ValueError("Could not initialize any Gemini model. Please check your API key and available models.")
+    # Use gemini-2.0-flash-exp directly
+    model = genai.GenerativeModel('gemini-2.0-flash-exp')
+    print(f"[OK] Using Google Gemini API model: gemini-2.0-flash-exp")
         
 except ImportError:
     raise ImportError("google-generativeai package is required. Install it with: pip install google-generativeai")
+except Exception as e:
+    raise ValueError(f"Could not initialize Gemini model: {e}")
 
 
 def summarize_text(text):
@@ -110,9 +75,17 @@ def summarize_text(text):
     
     try:
         response = model.generate_content(prompt)
-        if not response or not response.text:
+        if not response:
             raise ValueError("Empty response from Google API")
-        return response.text.strip()
+        # Handle different response formats
+        if hasattr(response, 'text') and response.text:
+            return response.text.strip()
+        elif hasattr(response, 'parts') and response.parts:
+            # Sometimes response comes in parts
+            text_parts = [part.text for part in response.parts if hasattr(part, 'text') and part.text]
+            if text_parts:
+                return " ".join(text_parts).strip()
+        raise ValueError("Empty or invalid response from Google API")
     except Exception as e:
         print(f"Error with Google API: {e}")
         raise
@@ -121,12 +94,29 @@ def summarize_text(text):
 def safe_reply_to(message, text, **kwargs):
     """Safely reply to a message with error handling."""
     try:
-        return bot.reply_to(message, text, **kwargs)
+        # Telegram has a 4096 character limit for messages
+        max_length = 4096
+        reply_text = text
+        if len(reply_text) > max_length:
+            # Truncate and add notice
+            reply_text = reply_text[:max_length - 50] + "\n\n... (message truncated)"
+            print(f"Warning: Message truncated to {max_length} characters")
+        
+        return bot.reply_to(message, reply_text, **kwargs)
     except Exception as e:
         print(f"Error sending reply: {e}")
         # Try to send a simple message instead if reply fails
         try:
-            bot.send_message(message.chat.id, text, **kwargs)
+            # Validate chat exists before trying to send message
+            if not hasattr(message, 'chat') or not message.chat or not hasattr(message.chat, 'id'):
+                print(f"Error: Cannot send message - chat information not available")
+                return None
+            
+            # Also truncate for send_message
+            send_text = text
+            if len(send_text) > 4096:
+                send_text = send_text[:4096 - 50] + "\n\n... (message truncated)"
+            bot.send_message(message.chat.id, send_text, **kwargs)
         except Exception as e2:
             print(f"Error sending message: {e2}")
         return None
@@ -134,30 +124,68 @@ def safe_reply_to(message, text, **kwargs):
 
 def save_message_to_csv(user_id, username, chat_id, text, date_str):
     """Helper function to save a message to CSV"""
-    df = pd.DataFrame([[user_id, username, chat_id, text, date_str]], 
-                      columns=["user_id", "username", "chat_id", "message", "date"])
-    
     try:
+        # Validate input
+        if text is None:
+            text = ""
+        if not isinstance(text, str):
+            text = str(text)
+        
+        df = pd.DataFrame([[user_id, username, chat_id, text, date_str]], 
+                          columns=["user_id", "username", "chat_id", "message", "date"])
+        
         # Check if file exists and has content before reading
         if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 0:
-            existing_df = pd.read_csv(LOG_FILE)
-            # Check if message already exists (avoid duplicates)
-            if not existing_df.empty and "message" in existing_df.columns:
-                # Simple duplicate check: same chat_id, message text, and similar timestamp
-                existing_df["date"] = pd.to_datetime(existing_df["date"])
-                date_obj = pd.to_datetime(date_str)
-                # Check for duplicates within 1 second
-                mask = (existing_df["chat_id"] == chat_id) & \
-                       (existing_df["message"] == text) & \
-                       (abs((existing_df["date"] - date_obj).dt.total_seconds()) < 1)
-                if mask.any():
-                    return False  # Message already exists
-            df = pd.concat([existing_df, df], ignore_index=True)
-    except (FileNotFoundError, pd.errors.EmptyDataError):
-        pass
-    
-    df.to_csv(LOG_FILE, index=False)
-    return True
+            try:
+                existing_df = pd.read_csv(LOG_FILE)
+                # Check if message already exists (avoid duplicates)
+                if not existing_df.empty and "message" in existing_df.columns:
+                    try:
+                        # Simple duplicate check: same chat_id, message text, and similar timestamp
+                        existing_df["date"] = pd.to_datetime(existing_df["date"], errors='coerce')
+                        date_obj = pd.to_datetime(date_str, errors='coerce')
+                        
+                        # Filter out NaT values (invalid dates)
+                        valid_dates = existing_df["date"].notna() & pd.notna(date_obj)
+                        if valid_dates.any():
+                            # Check if chat_id column exists for duplicate checking
+                            if "chat_id" in existing_df.columns:
+                                mask = (existing_df["chat_id"] == chat_id) & \
+                                       (existing_df["message"] == text) & \
+                                       valid_dates & \
+                                       (abs((existing_df["date"] - date_obj).dt.total_seconds()) < 1)
+                            else:
+                                # Legacy CSV without chat_id - check only message and date
+                                mask = (existing_df["message"] == text) & \
+                                       valid_dates & \
+                                       (abs((existing_df["date"] - date_obj).dt.total_seconds()) < 1)
+                            
+                            if mask.any():
+                                return False  # Message already exists
+                    except Exception as e:
+                        # If date parsing fails, skip duplicate check but still save
+                        print(f"Warning: Could not check for duplicates: {e}")
+                
+                # Ensure all required columns exist
+                required_columns = ["user_id", "username", "chat_id", "message", "date"]
+                for col in required_columns:
+                    if col not in existing_df.columns:
+                        existing_df[col] = None
+                
+                df = pd.concat([existing_df, df], ignore_index=True)
+            except (FileNotFoundError, pd.errors.EmptyDataError, pd.errors.ParserError) as e:
+                print(f"Warning: Could not read existing CSV, creating new one: {e}")
+                # Continue with new DataFrame
+            except Exception as e:
+                print(f"Error reading CSV file: {e}")
+                # Continue with new DataFrame
+        
+        # Write to CSV with error handling
+        df.to_csv(LOG_FILE, index=False, encoding='utf-8')
+        return True
+    except Exception as e:
+        print(f"Error saving message to CSV: {e}")
+        return False
 
 
 # Command to start the bot
@@ -188,6 +216,16 @@ def send_welcome(message):
 # Command to summarize messages based on selected time range or count
 @bot.message_handler(commands=["summarize"])
 def summarize_messages(message):
+    # Check if message.text exists
+    if not message.text:
+        safe_reply_to(message, "❌ Invalid command format.")
+        return
+    
+    # Validate chat exists
+    if not hasattr(message, 'chat') or not message.chat:
+        safe_reply_to(message, "❌ Error: Could not access chat information.")
+        return
+    
     chat_id = message.chat.id
     text_parts = message.text.split()
 
@@ -238,13 +276,43 @@ def summarize_messages(message):
         except pd.errors.EmptyDataError:
             safe_reply_to(message, "No messages found. The message log is empty. Start chatting in the group to log messages.")
             return
+        except pd.errors.ParserError as e:
+            safe_reply_to(message, "❌ Error reading message log file. The file may be corrupted.")
+            print(f"CSV parsing error: {e}")
+            return
+        except Exception as e:
+            safe_reply_to(message, f"❌ Error reading message log: {str(e)}")
+            print(f"Error reading CSV: {e}")
+            return
         
         # Check if DataFrame is empty
         if df.empty:
             safe_reply_to(message, "No messages found. The message log is empty. Start chatting in the group to log messages.")
             return
         
-        df["date"] = pd.to_datetime(df["date"])
+        # Validate required columns exist
+        required_columns = ["message", "date"]
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            safe_reply_to(message, f"❌ Message log is missing required columns: {', '.join(missing_columns)}")
+            return
+        
+        # Parse dates with error handling
+        try:
+            df["date"] = pd.to_datetime(df["date"], errors='coerce')
+            # Remove rows with invalid dates
+            invalid_dates = df["date"].isna()
+            if invalid_dates.any():
+                print(f"Warning: Found {invalid_dates.sum()} messages with invalid dates, skipping them")
+                df = df[~invalid_dates]
+            
+            if df.empty:
+                safe_reply_to(message, "No valid messages found in the log.")
+                return
+        except Exception as e:
+            safe_reply_to(message, f"❌ Error parsing dates in message log: {str(e)}")
+            print(f"Date parsing error: {e}")
+            return
 
         # Filter messages from the current group
         if "chat_id" not in df.columns:
@@ -281,7 +349,18 @@ def summarize_messages(message):
         group_messages = group_messages.sort_values("date", ascending=True)
 
         # Combine messages into one text block for summarization
-        messages_text = " ".join(group_messages["message"].tolist())
+        # Filter out None values and ensure all are strings
+        message_list = group_messages["message"].tolist()
+        message_list = [str(msg) if msg is not None else "" for msg in message_list]
+        message_list = [msg for msg in message_list if msg.strip()]  # Remove empty messages
+        
+        # Safety check: limit number of messages to prevent memory issues
+        max_messages = 10000
+        if len(message_list) > max_messages:
+            print(f"Warning: Limiting to {max_messages} messages for summarization")
+            message_list = message_list[-max_messages:]  # Take the most recent messages
+        
+        messages_text = " ".join(message_list)
 
         # Check if messages_text is empty
         if not messages_text or not messages_text.strip():
@@ -290,8 +369,21 @@ def summarize_messages(message):
 
         # Summarize messages
         try:
+            # Check if messages_text is too large before summarizing
+            if len(messages_text) > 1000000:  # 1MB limit
+                safe_reply_to(message, "❌ Too many messages to summarize. Please use a smaller time range or message count.")
+                return
+            
             summary = summarize_text(messages_text)
             safe_reply_to(message, f"📊 *Summary for {option_display}:*\n\n_{summary}_")
+        except ValueError as e:
+            # Handle API errors specifically
+            error_msg = str(e)
+            if "Empty" in error_msg or "invalid response" in error_msg.lower():
+                safe_reply_to(message, "❌ Error: Could not generate summary. The API returned an empty response.")
+            else:
+                safe_reply_to(message, f"❌ Error generating summary: {error_msg}")
+            print(f"Summarization error: {e}")
         except Exception as e:
             print(f"Summarization error: {e}")
             safe_reply_to(message, f"❌ Error generating summary: {str(e)}")
@@ -307,6 +399,11 @@ def summarize_messages(message):
 @bot.message_handler(commands=["sync"])
 def sync_messages(message):
     """Provides information about message syncing."""
+    # Validate chat exists
+    if not hasattr(message, 'chat') or not message.chat:
+        safe_reply_to(message, "❌ Error: Could not access chat information.")
+        return
+    
     if message.chat.type not in ["group", "supergroup"]:
         safe_reply_to(message, "This command can only be used in groups.")
         return
@@ -316,21 +413,36 @@ def sync_messages(message):
     try:
         # Count messages in the log for this chat
         if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 0:
-            df = pd.read_csv(LOG_FILE)
-            if "chat_id" in df.columns:
-                chat_messages = df[df["chat_id"] == chat_id]
-                message_count = len(chat_messages)
-            else:
-                message_count = len(df)
-            
-            safe_reply_to(
-                message,
-                f"✅ Message logging is active!\n\n"
-                f"📊 *Current stats:*\n"
-                f"- Messages logged in this group: {message_count}\n\n"
-                f"*Note:* The bot automatically logs all new messages sent after it was added to the group. "
-                f"Messages sent before the bot was added cannot be retrieved due to Telegram API restrictions."
-            )
+            try:
+                df = pd.read_csv(LOG_FILE)
+                if "chat_id" in df.columns:
+                    chat_messages = df[df["chat_id"] == chat_id]
+                    message_count = len(chat_messages)
+                else:
+                    message_count = len(df)
+                
+                safe_reply_to(
+                    message,
+                    f"✅ Message logging is active!\n\n"
+                    f"📊 *Current stats:*\n"
+                    f"- Messages logged in this group: {message_count}\n\n"
+                    f"*Note:* The bot automatically logs all new messages sent after it was added to the group. "
+                    f"Messages sent before the bot was added cannot be retrieved due to Telegram API restrictions."
+                )
+            except (pd.errors.EmptyDataError, pd.errors.ParserError) as e:
+                print(f"Error reading CSV in sync command: {e}")
+                safe_reply_to(
+                    message,
+                    "⚠️ Error reading message log file.\n\n"
+                    "The bot will continue to log new messages going forward."
+                )
+            except Exception as e:
+                print(f"Unexpected error in sync command: {e}")
+                safe_reply_to(
+                    message,
+                    "⚠️ Error checking message log.\n\n"
+                    "The bot automatically logs all new messages sent after it was added to the group."
+                )
         else:
             safe_reply_to(
                 message,
@@ -352,31 +464,57 @@ def sync_messages(message):
 @bot.message_handler(func=lambda message: True, content_types=["text"])
 def log_messages(message):
     """Logs all text messages from the group."""
-    if message.chat.type in ["group", "supergroup"]:
-        # Skip if message.text is None (e.g., for media messages)
-        if message.text is None:
+    try:
+        # Validate chat exists
+        if not hasattr(message, 'chat') or not message.chat:
             return
         
-        # Skip bot commands (they're handled separately)
-        if message.text.startswith('/'):
-            return
+        if message.chat.type in ["group", "supergroup"]:
+            # Skip if message.text is None (e.g., for media messages)
+            if message.text is None:
+                return
             
-        user_id = message.from_user.id
-        username = message.from_user.username or "Unknown"
-        chat_id = message.chat.id
-        text = message.text
-        date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Skip bot commands (they're handled separately)
+            if message.text.startswith('/'):
+                return
+            
+            # Check if from_user exists (may be None in channels or certain message types)
+            if message.from_user is None:
+                user_id = 0
+                username = "Unknown"
+            else:
+                user_id = message.from_user.id
+                username = message.from_user.username or "Unknown"
+            
+            chat_id = message.chat.id
+            text = message.text
+            
+            # Safety check: truncate extremely long messages to prevent issues
+            max_message_length = 100000  # 100k characters
+            if len(text) > max_message_length:
+                print(f"Warning: Truncating message from user {user_id} (length: {len(text)})")
+                text = text[:max_message_length]
+            
+            date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Safe print that handles Unicode characters
-        try:
-            print(f"Logging message: {username} ({user_id}) in chat {chat_id} - {text}")
-        except UnicodeEncodeError:
-            # Fallback for Windows console encoding issues
-            safe_text = text.encode('ascii', 'replace').decode('ascii')
-            print(f"Logging message: {username} ({user_id}) in chat {chat_id} - {safe_text}")
+            # Safe print that handles Unicode characters
+            try:
+                print(f"Logging message: {username} ({user_id}) in chat {chat_id} - {text}")
+            except UnicodeEncodeError:
+                # Fallback for Windows console encoding issues
+                safe_text = text.encode('ascii', 'replace').decode('ascii')
+                print(f"Logging message: {username} ({user_id}) in chat {chat_id} - {safe_text}")
+            except Exception as e:
+                # Silent fail for print errors
+                print(f"Error printing message: {e}")
 
-        # Save message to CSV using helper function
-        save_message_to_csv(user_id, username, chat_id, text, date)
+            # Save message to CSV using helper function
+            if not save_message_to_csv(user_id, username, chat_id, text, date):
+                # Only log if it's a duplicate (save_message_to_csv returns False for duplicates)
+                pass
+    except Exception as e:
+        # Silent fail for logging errors to prevent bot crashes
+        print(f"Error in log_messages: {e}")
 
 
 # Start the bot with error handling
