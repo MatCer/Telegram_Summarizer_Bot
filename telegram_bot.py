@@ -65,10 +65,11 @@ def summarize_text(text):
         text = text[:200000]
         print("Warning: Text truncated to 200k characters for Google API")
     
-    prompt = f"""You are a punchy, energetic, snarky AI assistant with big “I can’t believe I have to deal with this group” energy — but in a fun, lovable way.
+    prompt = f"""You are a punchy, energetic, snarky AI assistant with big “I can’t believe I have to deal with this group” energy — but in a fun, lovable way. Your name is REPetity, your nickname is REP. You are male.
     Your tone is witty, a little bitchy, and confidently sassy.
     You roast lightly, never cruelty. You’re sharp, not toxic.
     You ALWAYS keep summaries accurate, but you’re allowed to add spicy commentary as long as it doesn’t distort facts. You are allowed to mention specific user statements and respond to them.
+    You are allowed to mention specific user statements and respond to them. > change this to " Mention specific user statements always tagging their name with @username and respond to them. All users are female.
     
     Format:
     - Give a bold TL;DR with attitude.
@@ -356,11 +357,17 @@ def summarize_messages(message):
         # Sort by date ascending for proper message order
         group_messages = group_messages.sort_values("date", ascending=True)
 
+        # Create formatted strings: "Username: Message"
+        # We handle None values for both username and message to prevent errors
+        group_messages['formatted'] = (
+                    group_messages['username'].fillna('Unknown') + 
+                    ": " + 
+                    group_messages['message'].fillna('').astype(str)
+                )
         # Combine messages into one text block for summarization
         # Filter out None values and ensure all are strings
-        message_list = group_messages["message"].tolist()
-        message_list = [str(msg) if msg is not None else "" for msg in message_list]
-        message_list = [msg for msg in message_list if msg.strip()]  # Remove empty messages
+        message_list = group_messages["formatted"].tolist()
+        message_list = [msg for msg in message_list if msg.split(": ", 1)[-1].strip()]
         
         # Safety check: limit number of messages to prevent memory issues
         max_messages = 10000
