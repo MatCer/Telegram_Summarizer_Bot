@@ -376,6 +376,8 @@ def summarize_messages(message):
             
             summary = summarize_text(messages_text)
             safe_reply_to(message, f"📊 *Summary for {option_display}:*\n\n_{summary}_")
+            
+            cleanup_old_messages(days_to_keep=7)
         except ValueError as e:
             # Handle API errors specifically
             error_msg = str(e)
@@ -516,6 +518,29 @@ def log_messages(message):
         # Silent fail for logging errors to prevent bot crashes
         print(f"Error in log_messages: {e}")
 
+def cleanup_old_messages(days_to_keep=7):
+    """Removes messages older than the specified number of days from the CSV."""
+    if not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0:
+        return
+
+    try:
+        df = pd.read_csv(LOG_FILE)
+        df["date"] = pd.to_datetime(df["date"], errors='coerce')
+        
+        # Define cutoff
+        cutoff_date = datetime.datetime.now() - datetime.timedelta(days=days_to_keep)
+        
+        # Keep only new messages
+        initial_count = len(df)
+        df = df[df["date"] >= cutoff_date]
+        final_count = len(df)
+        
+        # Save back to CSV
+        df.to_csv(LOG_FILE, index=False, encoding='utf-8')
+        print(f"[Cleanup] Removed {initial_count - final_count} old messages.")
+        
+    except Exception as e:
+        print(f"Cleanup error: {e}")
 
 # Start the bot with error handling
 def start_bot():

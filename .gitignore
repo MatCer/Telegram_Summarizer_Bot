@@ -9,6 +9,7 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 ENV/
 build/
 develop-eggs/
@@ -40,4 +41,3 @@ Thumbs.db
 # Logs and data
 *.log
 group_messages.csv
-
