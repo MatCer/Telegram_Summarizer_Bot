@@ -1,0 +1,12 @@
+[Unit]
+Description=Telegram Summarizer Bot
+After=network.target
+
+[Service]
+User=[user]
+WorkingDirectory=/home/[user]/Telegram_Summarizer_Bot
+ExecStart=/home/[user]/Telegram_Summarizer_Bot/venv/bin/python telegram_bot.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
