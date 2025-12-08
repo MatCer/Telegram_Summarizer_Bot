@@ -3,7 +3,7 @@ import pandas as pd
 import datetime
 import os
 import time
-
+import sqlite3
 import sys
 from dotenv import load_dotenv
 
@@ -13,6 +13,7 @@ load_dotenv()
 # Get secrets from environment variables
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+DB_FILE = "bot_data.db"
 
 # Validate required tokens
 if not TOKEN:
@@ -56,6 +57,14 @@ except ImportError:
 except Exception as e:
     raise ValueError(f"Could not initialize Gemini model: {e}")
 
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS messages
+                 (user_id INTEGER, username TEXT, chat_id INTEGER, 
+                  message TEXT, date TIMESTAMP)''')
+    conn.commit()
+    conn.close()
 
 def summarize_text(text):
     """Summarize text using Google Gemini API"""
@@ -196,6 +205,18 @@ def save_message_to_csv(user_id, username, chat_id, text, date_str):
         print(f"Error saving message to CSV: {e}")
         return False
 
+def save_message_to_db(user_id, username, chat_id, text, date_str):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
+                  (user_id, username, chat_id, text, date_str))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Error saving to SQLite: {e}")
+        return False
 
 # Command to start the bot
 @bot.message_handler(commands=["start"])
@@ -238,178 +259,83 @@ def summarize_messages(message):
     chat_id = message.chat.id
     text_parts = message.text.split()
 
-    # Check if using count-based option (e.g., "last 50")
+    # Determine selection mode (count-based vs time-based)
     is_count_based = len(text_parts) >= 3 and text_parts[1].lower() == "last"
     
     if is_count_based:
-        # Count-based summarization
         try:
             count = int(text_parts[2])
-            if count <= 0:
-                raise ValueError("Count must be positive")
+            if count <= 0: raise ValueError
             if count > 10000:
-                safe_reply_to(message, "❌ Maximum count is 10000 messages. Please use a smaller number.")
+                safe_reply_to(message, "❌ Maximum count is 10000 messages.")
                 return
-            
             option_display = f"last {count} messages"
-            
         except (ValueError, IndexError):
-            safe_reply_to(
-                message,
-                "Invalid format for count-based option.\n\n"
-                "Use: `/summarize last <number>`\n"
-                "Example: `/summarize last 50`"
-            )
+            safe_reply_to(message, "Usage: `/summarize last <number>`")
             return
     elif len(text_parts) == 2 and text_parts[1] in TIME_INTERVALS:
-        # Time-based summarization (existing functionality)
         hours = TIME_INTERVALS[text_parts[1]]
         option_display = text_parts[1]
     else:
-        safe_reply_to(
-            message,
-            "Invalid format. Use:\n"
-            "- `/summarize <time_option>` (e.g., `/summarize 1day`)\n"
-            "- `/summarize last <number>` (e.g., `/summarize last 50`)"
-        )
+        safe_reply_to(message, "Invalid format. Use `/summarize 1day` or `/summarize last 50`.")
         return
 
+    # --- SQLITE DATA RETRIEVAL ---
     try:
-        # Check if file exists and has content
-        if not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0:
-            safe_reply_to(message, "No messages found. The message log is empty. Start chatting in the group to log messages.")
-            return
-        
-        try:
-            df = pd.read_csv(LOG_FILE)
-        except pd.errors.EmptyDataError:
-            safe_reply_to(message, "No messages found. The message log is empty. Start chatting in the group to log messages.")
-            return
-        except pd.errors.ParserError as e:
-            safe_reply_to(message, "❌ Error reading message log file. The file may be corrupted.")
-            print(f"CSV parsing error: {e}")
-            return
-        except Exception as e:
-            safe_reply_to(message, f"❌ Error reading message log: {str(e)}")
-            print(f"Error reading CSV: {e}")
-            return
-        
-        # Check if DataFrame is empty
-        if df.empty:
-            safe_reply_to(message, "No messages found. The message log is empty. Start chatting in the group to log messages.")
-            return
-        
-        # Validate required columns exist
-        required_columns = ["message", "date"]
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        if missing_columns:
-            safe_reply_to(message, f"❌ Message log is missing required columns: {', '.join(missing_columns)}")
-            return
-        
-        # Parse dates with error handling
-        try:
-            df["date"] = pd.to_datetime(df["date"], errors='coerce')
-            # Remove rows with invalid dates
-            invalid_dates = df["date"].isna()
-            if invalid_dates.any():
-                print(f"Warning: Found {invalid_dates.sum()} messages with invalid dates, skipping them")
-                df = df[~invalid_dates]
-            
-            if df.empty:
-                safe_reply_to(message, "No valid messages found in the log.")
-                return
-        except Exception as e:
-            safe_reply_to(message, f"❌ Error parsing dates in message log: {str(e)}")
-            print(f"Date parsing error: {e}")
-            return
-
-        # Filter messages from the current group
-        if "chat_id" not in df.columns:
-            # Legacy CSV without chat_id - filter all messages
-            if is_count_based:
-                # For count-based, get last N messages sorted by date
-                group_messages = df.sort_values("date", ascending=False).head(count)
-            else:
-                # Time-based: filter by time range
-                end_time = datetime.datetime.now()
-                start_time = end_time - datetime.timedelta(hours=hours)
-                group_messages = df[(df["date"] >= start_time) & (df["date"] <= end_time)]
+        conn = sqlite3.connect(DB_FILE)
+        # We use pandas read_sql_query for compatibility with your existing list processing
+        if is_count_based:
+            # Get last X messages. Note: We sort DESC to get the limit, then reverse it later.
+            query = "SELECT username, message FROM messages WHERE chat_id = ? ORDER BY date DESC LIMIT ?"
+            group_messages = pd.read_sql_query(query, conn, params=(chat_id, count))
+            # Reverse to maintain chronological order for Gemini
+            group_messages = group_messages.iloc[::-1]
         else:
-            # Filter by chat_id to ensure we only summarize messages from this group
-            chat_filtered = df[df["chat_id"] == chat_id]
-            
-            if is_count_based:
-                # For count-based, get last N messages sorted by date
-                group_messages = chat_filtered.sort_values("date", ascending=False).head(count)
-            else:
-                # Time-based: filter by time range
-                end_time = datetime.datetime.now()
-                start_time = end_time - datetime.timedelta(hours=hours)
-                group_messages = chat_filtered[(chat_filtered["date"] >= start_time) & (chat_filtered["date"] <= end_time)]
+            # Get messages since X hours ago
+            start_time = (datetime.datetime.now() - datetime.timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            query = "SELECT username, message FROM messages WHERE chat_id = ? AND date >= ? ORDER BY date ASC"
+            group_messages = pd.read_sql_query(query, conn, params=(chat_id, start_time))
+        
+        conn.close()
 
         if group_messages.empty:
-            if is_count_based:
-                safe_reply_to(message, f"No messages found in this group.")
-            else:
-                safe_reply_to(message, "No messages found in the selected time range.")
+            safe_reply_to(message, f"No messages found for {option_display}.")
             return
 
-        # Sort by date ascending for proper message order
-        group_messages = group_messages.sort_values("date", ascending=True)
-
-        # Create formatted strings: "Username: Message"
-        # We handle None values for both username and message to prevent errors
+        # Process the messages into a single string
+        # Use .fillna() to ensure we don't have crash-inducing 'None' values
         group_messages['formatted'] = (
-                    group_messages['username'].fillna('Unknown') + 
-                    ": " + 
-                    group_messages['message'].fillna('').astype(str)
-                )
-        # Combine messages into one text block for summarization
-        # Filter out None values and ensure all are strings
-        message_list = group_messages["formatted"].tolist()
-        message_list = [msg for msg in message_list if msg.split(": ", 1)[-1].strip()]
+            group_messages['username'].fillna('Unknown') + 
+            ": " + 
+            group_messages['message'].fillna('')
+        )
         
-        # Safety check: limit number of messages to prevent memory issues
-        max_messages = 10000
-        if len(message_list) > max_messages:
-            print(f"Warning: Limiting to {max_messages} messages for summarization")
-            message_list = message_list[-max_messages:]  # Take the most recent messages
-        
+        message_list = group_messages['formatted'].tolist()
         messages_text = " ".join(message_list)
 
-        # Check if messages_text is empty
-        if not messages_text or not messages_text.strip():
-            safe_reply_to(message, "No valid messages found.")
-            return
+        # Final safety check on text length before hitting Gemini API
+        if len(messages_text) > 500000: # 500k chars is plenty for a summary
+            messages_text = messages_text[-500000:]
+            print("Warning: Input text truncated to 500k characters.")
 
-        # Summarize messages
+        # --- GENERATE SUMMARY ---
         try:
-            # Check if messages_text is too large before summarizing
-            if len(messages_text) > 1000000:  # 1MB limit
-                safe_reply_to(message, "❌ Too many messages to summarize. Please use a smaller time range or message count.")
-                return
-            
             summary = summarize_text(messages_text)
             safe_reply_to(message, f"📊 *Summary for {option_display}:*\n\n_{summary}_")
             
+            # Optional: Perform periodic cleanup of old messages (e.g. older than 7 days)
             cleanup_old_messages(days_to_keep=7)
-        except ValueError as e:
-            # Handle API errors specifically
-            error_msg = str(e)
-            if "Empty" in error_msg or "invalid response" in error_msg.lower():
-                safe_reply_to(message, "❌ Error: Could not generate summary. The API returned an empty response.")
-            else:
-                safe_reply_to(message, f"❌ Error generating summary: {error_msg}")
-            print(f"Summarization error: {e}")
+            
         except Exception as e:
-            print(f"Summarization error: {e}")
-            safe_reply_to(message, f"❌ Error generating summary: {str(e)}")
+            print(f"Gemini Error: {e}")
+            safe_reply_to(message, "❌ Error generating summary. Gemini might be busy.")
 
-    except FileNotFoundError:
-        safe_reply_to(message, "No messages found. Ensure message logging is enabled.")
+    except sqlite3.Error as e:
+        print(f"Database Error: {e}")
+        safe_reply_to(message, "❌ Database error. Please check logs.")
     except Exception as e:
-        print(f"Error: {e}")
-        safe_reply_to(message, f"❌ An error occurred: {str(e)}")
+        print(f"Unexpected Error: {e}")
+        safe_reply_to(message, "❌ An unexpected error occurred.")
 
 
 # Command to sync/fetch recent messages
@@ -526,14 +452,14 @@ def log_messages(message):
                 print(f"Error printing message: {e}")
 
             # Save message to CSV using helper function
-            if not save_message_to_csv(user_id, username, chat_id, text, date):
+            if not save_message_to_db(user_id, username, chat_id, text, date):
                 # Only log if it's a duplicate (save_message_to_csv returns False for duplicates)
                 pass
     except Exception as e:
         # Silent fail for logging errors to prevent bot crashes
         print(f"Error in log_messages: {e}")
 
-def cleanup_old_messages(days_to_keep=7):
+def cleanup_old_messages_csv(days_to_keep=7):
     """Removes messages older than the specified number of days from the CSV."""
     if not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0:
         return
@@ -554,6 +480,18 @@ def cleanup_old_messages(days_to_keep=7):
         df.to_csv(LOG_FILE, index=False, encoding='utf-8')
         print(f"[Cleanup] Removed {initial_count - final_count} old messages.")
         
+    except Exception as e:
+        print(f"Cleanup error: {e}")
+        
+def cleanup_old_messages(days_to_keep=7):
+    try:
+        cutoff = (datetime.datetime.now() - datetime.timedelta(days=days_to_keep)).strftime("%Y-%m-%d %H:%M:%S")
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("DELETE FROM messages WHERE date < ?", (cutoff,))
+        conn.commit()
+        print(f"[Cleanup] Removed messages older than {cutoff}")
+        conn.close()
     except Exception as e:
         print(f"Cleanup error: {e}")
 
@@ -589,4 +527,5 @@ def start_bot():
 
 if __name__ == "__main__":
     print("Bot is running...")
+    init_db()
     start_bot()
